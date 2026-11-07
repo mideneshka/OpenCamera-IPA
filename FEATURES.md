@@ -9,12 +9,12 @@ Open Camera functionality; no claim of complete parity is made.
 |---|---|---|
 | Camera preview, tap focus, physical lens switch | Swift AVFoundation | Source written; device test pending |
 | Photo JPEG, flash, digital zoom | Swift AVFoundation | Source written; preview/photo field of view must be tested |
-| Bayer RAW + JPEG pair | AVFoundation RAW format query, DNG original retained | Source written; lens/device support pending |
-| NR 3/5/7-frame sequence | Sequential capture, locked exposure/focus/WB; Rust registration/fusion | Rust synthetic tests; capture not verified |
-| HDR 3/5/7 frames and ±2/3/4 EV | Sequential bias requests, EXIF exposure normalization, Rust tone mapping | Synthetic shadow/highlight tests for 3/5/7 pass; camera test pending |
+| Bayer RAW + JPEG pair | AVFoundation RAW format query, DNG original retained | Immediate quality-setter crash identified on iPhone; speed-priority fix awaits device test |
+| NR 3/5/7-frame sequence | Hardware bracket packets, locked exposure/focus/WB; Rust registration/fusion | Rust synthetic tests; capture not verified |
+| HDR 3/5/7 frames and ±2/3/4 EV | Hardware auto-exposure brackets, EXIF exposure normalization, Rust tone mapping | Synthetic shadow/highlight tests for 3/5/7 pass; camera test pending |
 | Integer translation, reject unrelated frames | Rust normalized correlation | Known-shift, flat-image, unrelated-image tests pass |
 | Deghosting | NR local luminance rejection only | No full optical flow, rotation, parallax or HDR deghosting |
-| NLM | Rust CPU reference, patch3/search7 | Synthetic flat-noise test; performance unmeasured |
+| NLM | Rust CPU patch3/search7 with row cache and patch-distance reuse | Reference equivalence within 1 LSB; Windows release microbenchmark 3.07x faster; iPhone timing pending |
 | Dehaze, contrast, saturation, temperature | Rust linear-light adjustments | Identity and temperature tests; device quality unmeasured |
 | Sharpening | Rust bounded unsharp mask | Not AMD RCAS; no equivalence claim |
 | Manual ISO / shutter / focus / WB / EV | Swift AVFoundation, hardware-clamped | Source written; exposure restoration needs real-device check |

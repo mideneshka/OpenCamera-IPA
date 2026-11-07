@@ -150,6 +150,9 @@ pub unsafe extern "C" fn hc_run(
                     )?
                 };
                 c.report = fused.alignments;
+                // Release the full burst before allocating denoise/postprocess buffers.
+                c.frames.clear();
+                c.exposures.clear();
                 process(&fused.image, settings, &stop)?
             }
             _ => return Err(Error::Parameters),

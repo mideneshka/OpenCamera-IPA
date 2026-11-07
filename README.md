@@ -61,7 +61,7 @@ Only integer translation is handled; camera rotation, parallax and local motion 
 cause rejection, blur or ghosts. No crop or digital zoom is introduced by fusion.
 
 Rust input is bounded to 13 million pixels per image and 7 images; no hidden downscale.
-CPU NLM is a reference implementation and can take a long time at full resolution.
+CPU NLM uses a nine-row color cache and reused patch distances. A Windows release microbenchmark at 512x384 measured 676 ms before and 220 ms after (3.07x); this is not an iPhone or whole-pipeline timing. Full-resolution processing still needs device measurements.
 Registration is bounded to ±12 pixels in the app. Seven frames require hundreds of MB.
 No low-memory-device performance or camera output quality has been measured.
 
@@ -80,3 +80,7 @@ References: [Apple AVCam](https://developer.apple.com/documentation/avfoundation
 [GitHub runners](https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/choose-the-runner-for-a-job),
 [Apple Personal Team](https://developer.apple.com/help/account/basics/about-your-developer-account),
 [Sideloadly FAQ](https://sideloadly.io/faq.html).
+
+## Update 0.1.1 (build 2)
+
+RAW requests use speed prioritization: device crash logs identified the previous quality setter as the immediate exception. NR/HDR use hardware photo brackets, split at the camera limit; originals are buffered until the full sequence completes. This reduces inter-frame overhead but does not shorten exposure duration or eliminate subject motion. Tap focus performs a single scan at the preview-converted point and shows a yellow marker. The supplied app icon is included. These changes require a fresh device test.

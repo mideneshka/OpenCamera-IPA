@@ -212,6 +212,7 @@ fn fuse_impl(
     for image in &frames[1..] {
         shifts.push(align(base, image, radius, stop)?);
     }
+    let linear_table: [f32; 256] = std::array::from_fn(|i| linear(i as f32 / 255.0));
     let mut out = buffer(base.pixels.len())?;
     for y in 0..base.height {
         cancelled(stop)?;
@@ -249,7 +250,7 @@ fn fuse_impl(
                 };
                 for (c, channel) in rgb.iter_mut().enumerate() {
                     let scale = exposures.map(|e| e[0] / e[i]).unwrap_or(1.0);
-                    *channel += linear(frame.pixels[q + c] as f32 / 255.0) * weight * scale;
+                    *channel += linear_table[frame.pixels[q + c] as usize] * weight * scale;
                 }
                 total += weight;
             }
@@ -333,8 +334,8 @@ fn ycc(image: &Image, x: usize, y: usize) -> [f32; 3] {
         0.5 * r - 0.418688 * g - 0.081312 * b,
     ]
 }
-/// CPU reference NLM, 3x3 patch and 7x7 search, O(441 * pixels).
-/// Bounded input and row cancellation; intentionally not advertised as real-time.
+/// Exact 3x3-patch / 7x7-search NLM with cached colour rows and sliding patch sums.
+/// Only nine YCbCr rows and one accumulation row are retained (no full-image float cache).
 pub fn nlm(image: &Image, strength: f32, stop: &impl Fn() -> bool) -> Result<Image> {
     if !strength.is_finite() || !(0.0..=16.0).contains(&strength) {
         return Err(Error::Parameters);
@@ -342,55 +343,106 @@ pub fn nlm(image: &Image, strength: f32, stop: &impl Fn() -> bool) -> Result<Ima
     if strength == 0.0 {
         return Ok(image.clone());
     }
+    let w = image.width;
+    let h = image.height;
     let mut output = buffer(image.pixels.len())?;
-    let h2 = strength * strength;
-    for y in 0..image.height {
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(9 * w).map_err(|_| Error::Memory)?;
+    rows.resize(9 * w, [0.0f32; 3]);
+    let mut row_ids = [usize::MAX; 9];
+    let mut sums = Vec::new();
+    sums.try_reserve_exact(w).map_err(|_| Error::Memory)?;
+    sums.resize(w, [0.0f32; 4]);
+    let mut columns = Vec::new();
+    columns
+        .try_reserve_exact(w + 2)
+        .map_err(|_| Error::Memory)?;
+    columns.resize(w + 2, 0.0f32);
+    let divisor = 18.0 * strength * strength;
+    let distance = |a: [f32; 3], b: [f32; 3]| {
+        (a[0] - b[0]).powi(2) + 0.5 * (a[1] - b[1]).powi(2) + 0.5 * (a[2] - b[2]).powi(2)
+    };
+    for y in 0..h {
         cancelled(stop)?;
-        for x in 0..image.width {
-            let mut sum = [0.0; 3];
-            let mut weights = 0.0;
-            for dy in -3isize..=3 {
-                for dx in -3isize..=3 {
-                    let cx = clamped(x as isize + dx, image.width);
-                    let cy = clamped(y as isize + dy, image.height);
-                    let mut distance = 0.0;
+        for yy in y.saturating_sub(4)..=(y + 4).min(h - 1) {
+            let slot = yy % 9;
+            if row_ids[slot] != yy {
+                for x in 0..w {
+                    rows[slot * w + x] = ycc(image, x, yy);
+                }
+                row_ids[slot] = yy;
+            }
+        }
+        sums.fill([0.0; 4]);
+        for dy in -3isize..=3 {
+            let cy = clamped(y as isize + dy, h);
+            for dx in -3isize..=3 {
+                for (column, value) in columns.iter_mut().enumerate() {
+                    let xx = column as isize - 1;
+                    *value = 0.0;
                     for py in -1isize..=1 {
-                        for px in -1isize..=1 {
-                            let a = ycc(
-                                image,
-                                clamped(x as isize + px, image.width),
-                                clamped(y as isize + py, image.height),
-                            );
-                            let b = ycc(
-                                image,
-                                clamped(cx as isize + px, image.width),
-                                clamped(cy as isize + py, image.height),
-                            );
-                            distance += (a[0] - b[0]).powi(2)
-                                + 0.5 * (a[1] - b[1]).powi(2)
-                                + 0.5 * (a[2] - b[2]).powi(2);
+                        let ay = clamped(y as isize + py, h) % 9;
+                        let by = clamped(cy as isize + py, h) % 9;
+                        *value += distance(
+                            rows[ay * w + clamped(xx, w)],
+                            rows[by * w + clamped(xx + dx, w)],
+                        );
+                    }
+                }
+                for (x, sum) in sums.iter_mut().enumerate() {
+                    let cx = clamped(x as isize + dx, w);
+                    let d = if (0..w as isize).contains(&(x as isize + dx)) {
+                        columns[x] + columns[x + 1] + columns[x + 2]
+                    } else {
+                        // Clamp the neighbour centre before its patch, as in the reference.
+                        let mut d = 0.0;
+                        for py in -1isize..=1 {
+                            let ay = clamped(y as isize + py, h) % 9;
+                            let by = clamped(cy as isize + py, h) % 9;
+                            for px in -1isize..=1 {
+                                d += distance(
+                                    rows[ay * w + clamped(x as isize + px, w)],
+                                    rows[by * w + clamped(cx as isize + px, w)],
+                                );
+                            }
                         }
+                        d
+                    };
+                    let weight = (-d / divisor).exp();
+                    let q = (cy * w + cx) * 4;
+                    for (c, channel) in sum.iter_mut().enumerate().take(3) {
+                        *channel += image.pixels[q + c] as f32 * weight;
                     }
-                    let w = (-distance / (18.0 * h2)).exp();
-                    let q = (cy * image.width + cx) * 4;
-                    for (c, channel) in sum.iter_mut().enumerate() {
-                        *channel += image.pixels[q + c] as f32 * w;
-                    }
-                    weights += w;
+                    sum[3] += weight;
                 }
             }
-            let p = (y * image.width + x) * 4;
+        }
+        for (x, sum) in sums.iter().enumerate() {
+            let p = (y * w + x) * 4;
             for c in 0..3 {
-                output[p + c] = (sum[c] / weights).round() as u8;
+                output[p + c] = (sum[c] / sum[3]).round() as u8;
             }
             output[p + 3] = image.pixels[p + 3];
         }
     }
-    Image::new(image.width, image.height, output)
+    Image::new(w, h, output)
 }
 pub fn process(image: &Image, settings: Adjustments, stop: &impl Fn() -> bool) -> Result<Image> {
     settings.validate()?;
     let source = nlm(image, settings.denoise, stop)?;
+    if settings.dehaze == 0.0
+        && settings.contrast == 0.0
+        && settings.saturation == 1.0
+        && settings.temperature == 0.0
+    {
+        cancelled(stop)?;
+        return if settings.sharpen == 0.0 {
+            Ok(source)
+        } else {
+            sharpen(&source, settings.sharpen, stop)
+        };
+    }
+    let linear_table: [f32; 256] = std::array::from_fn(|i| linear(i as f32 / 255.0));
     let mut output = buffer(source.pixels.len())?;
     for y in 0..image.height {
         cancelled(stop)?;
@@ -405,7 +457,7 @@ pub fn process(image: &Image, settings: Adjustments, stop: &impl Fn() -> bool) -
                             + clamped(x as isize + dx, image.width))
                             * 4;
                         for c in 0..3 {
-                            dark = dark.min(linear(source.pixels[q + c] as f32 / 255.0));
+                            dark = dark.min(linear_table[source.pixels[q + c] as usize]);
                         }
                     }
                 }
@@ -413,7 +465,7 @@ pub fn process(image: &Image, settings: Adjustments, stop: &impl Fn() -> bool) -
             let haze = (dark * settings.dehaze).min(0.08 * settings.dehaze);
             for (c, channel) in color.iter_mut().enumerate() {
                 *channel =
-                    ((linear(source.pixels[p + c] as f32 / 255.0) - haze) / (1.0 - haze)).max(0.0);
+                    ((linear_table[source.pixels[p + c] as usize] - haze) / (1.0 - haze)).max(0.0);
             }
             color[0] *= 1.0 + settings.temperature * 0.2;
             color[2] *= 1.0 - settings.temperature * 0.2;
@@ -637,4 +689,112 @@ mod hdr_tests {
             ));
         }
     }
+}
+
+#[cfg(test)]
+fn nlm_reference(image: &Image, strength: f32, stop: &impl Fn() -> bool) -> Result<Image> {
+    if !strength.is_finite() || !(0.0..=16.0).contains(&strength) {
+        return Err(Error::Parameters);
+    }
+    if strength == 0.0 {
+        return Ok(image.clone());
+    }
+    let mut output = buffer(image.pixels.len())?;
+    let h2 = strength * strength;
+    for y in 0..image.height {
+        cancelled(stop)?;
+        for x in 0..image.width {
+            let mut sum = [0.0; 3];
+            let mut weights = 0.0;
+            for dy in -3isize..=3 {
+                for dx in -3isize..=3 {
+                    let cx = clamped(x as isize + dx, image.width);
+                    let cy = clamped(y as isize + dy, image.height);
+                    let mut distance = 0.0;
+                    for py in -1isize..=1 {
+                        for px in -1isize..=1 {
+                            let a = ycc(
+                                image,
+                                clamped(x as isize + px, image.width),
+                                clamped(y as isize + py, image.height),
+                            );
+                            let b = ycc(
+                                image,
+                                clamped(cx as isize + px, image.width),
+                                clamped(cy as isize + py, image.height),
+                            );
+                            distance += (a[0] - b[0]).powi(2)
+                                + 0.5 * (a[1] - b[1]).powi(2)
+                                + 0.5 * (a[2] - b[2]).powi(2);
+                        }
+                    }
+                    let w = (-distance / (18.0 * h2)).exp();
+                    let q = (cy * image.width + cx) * 4;
+                    for (c, channel) in sum.iter_mut().enumerate() {
+                        *channel += image.pixels[q + c] as f32 * w;
+                    }
+                    weights += w;
+                }
+            }
+            let p = (y * image.width + x) * 4;
+            for c in 0..3 {
+                output[p + c] = (sum[c] / weights).round() as u8;
+            }
+            output[p + 3] = image.pixels[p + 3];
+        }
+    }
+    Image::new(image.width, image.height, output)
+}
+
+#[cfg(test)]
+#[test]
+fn optimized_nlm_matches_reference_including_edges() {
+    for (w, h) in [(1, 1), (2, 5), (13, 11), (37, 19)] {
+        let pixels = (0..w * h * 4)
+            .map(|i| ((i * 73 + i * i * 19) % 256) as u8)
+            .collect();
+        let image = Image::new(w, h, pixels).unwrap();
+        for strength in [0.1, 3.0, 7.0, 16.0] {
+            let a = nlm_reference(&image, strength, &|| false).unwrap();
+            let b = nlm(&image, strength, &|| false).unwrap();
+            for (i, (a, b)) in a.pixels.iter().zip(&b.pixels).enumerate() {
+                assert!(
+                    (*a as i16 - *b as i16).abs() <= 1,
+                    "{w}x{h}, pixel {i}: {a} != {b}"
+                );
+                if i % 4 == 3 {
+                    assert_eq!(a, b);
+                }
+            }
+        }
+    }
+}
+#[cfg(test)]
+#[test]
+#[ignore = "manual release benchmark"]
+fn benchmark_nlm_reference_and_optimized() {
+    let (w, h) = (512, 384);
+    let image = Image::new(
+        w,
+        h,
+        (0..w * h * 4)
+            .map(|i| ((i * 73 + i * i * 19) % 256) as u8)
+            .collect(),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let a = nlm_reference(&image, 7.0, &|| false).unwrap();
+    let reference = started.elapsed();
+    let started = std::time::Instant::now();
+    let b = nlm(&image, 7.0, &|| false).unwrap();
+    let optimized = started.elapsed();
+    assert!(a
+        .pixels
+        .iter()
+        .zip(&b.pixels)
+        .all(|(a, b)| (*a as i16 - *b as i16).abs() <= 1));
+    println!(
+        "NLM 512x384 reference={reference:?}, optimized={optimized:?}, speedup={:.2}x",
+        reference.as_secs_f64() / optimized.as_secs_f64()
+    );
 }

@@ -23,6 +23,10 @@ final class CameraService: NSObject, ObservableObject, AVCapturePhotoCaptureDele
     private var taking=false
     private var sequence:[Data]=[]
     private var rawFiles:[Data]=[]
+    private var captureStarted=Date()
+    private var completionStatus="Сохранено в Фото"
+    private var batchCount=1
+    private var activeCaptureID:Int64?
     private var remaining=0
     private var index=0
     private var total=1
@@ -96,7 +100,7 @@ final class CameraService: NSObject, ObservableObject, AVCapturePhotoCaptureDele
     }
     private func updateCapabilities() {
         guard let d=device else {return}
-        let raw = !photos.availableRawPhotoPixelFormatTypes.isEmpty
+        let raw = photos.availableRawPhotoPixelFormatTypes.contains{!AVCapturePhotoOutput.isAppleProRAWPixelFormat($0)}
         let maxZoom=Double(min(d.activeFormat.videoMaxZoomFactor,10))
         let lo=Double(d.activeFormat.minISO), hi=Double(d.activeFormat.maxISO)
         let minT=max(0.000001,CMTimeGetSeconds(d.activeFormat.minExposureDuration))
@@ -124,9 +128,15 @@ final class CameraService: NSObject, ObservableObject, AVCapturePhotoCaptureDele
     func autoExposure() {control {d in if d.isExposureModeSupported(.continuousAutoExposure) {d.exposureMode = .continuousAutoExposure}}}
     func focus(_ point:CGPoint) {
         control {d in
-            if d.isFocusPointOfInterestSupported {d.focusPointOfInterest=point}
-            if d.isFocusModeSupported(.autoFocus) {d.focusMode = .autoFocus}
-            if d.isExposurePointOfInterestSupported {d.exposurePointOfInterest=point}
+            guard d.isFocusPointOfInterestSupported,d.isFocusModeSupported(.autoFocus) else {
+                self.publish{self.status="Этот объектив не поддерживает фокус по нажатию"}
+                return
+            }
+            d.focusPointOfInterest=CGPoint(x:point.x.clamped(to:0...1),y:point.y.clamped(to:0...1))
+            // One autofocus scan at the tapped subject; do not meter a different exposure.
+            d.focusMode = .autoFocus
+            d.isSubjectAreaChangeMonitoringEnabled=false
+            self.publish{self.status="Фокус по выбранной точке"}
         }
     }
     func focusDistance(_ value:Float) {control {d in if d.isLockingFocusWithCustomLensPositionSupported {d.setFocusModeLocked(lensPosition:value.clamped(to:0...1),completionHandler:nil)}}}
@@ -148,6 +158,7 @@ final class CameraService: NSObject, ObservableObject, AVCapturePhotoCaptureDele
             guard self.configured,!self.taking,!self.movie.isRecording else {return}
             if mode == .video {self.beginVideo(); return}
             self.taking=true; self.cancelled=false; self.sequence=[]; self.rawFiles=[]
+            self.captureStarted=Date(); self.completionStatus="Сохранено в Фото"
             self.captureMode=mode; self.captureOptions=options; self.hdrRange=hdrRange
             self.total=(mode == .noise || mode == .hdr) ? ([3,5,7].contains(frames) ? frames:3) : 1
             self.remaining=self.total; self.index=0; self.baseBias=self.device?.exposureTargetBias ?? 0
@@ -169,61 +180,92 @@ final class CameraService: NSObject, ObservableObject, AVCapturePhotoCaptureDele
     }
     private func nextPhoto(flash:Bool) {
         if cancelled {finish(error:CameraFailure.message("Съёмка отменена")); return}
-        let send={
-            if self.cancelled {self.finish(error:CameraFailure.message("Съёмка отменена")); return}
-            var settings=AVCapturePhotoSettings(format:[AVVideoCodecKey:AVVideoCodecType.jpeg])
-            if self.captureMode == .raw {
-                guard let format=self.photos.availableRawPhotoPixelFormatTypes.first else {self.finish(error:CameraFailure.message("RAW недоступен для этого объектива")); return}
-                settings=AVCapturePhotoSettings(rawPixelFormatType:format,processedFormat:[AVVideoCodecKey:AVVideoCodecType.jpeg])
-            }
-            if self.total==1,self.captureMode != .raw,self.photos.supportedFlashModes.contains(.on) {settings.flashMode=flash ? .on:.off}
-            settings.photoQualityPrioritization = .quality
-            if let connection=self.photos.connection(with:.video),connection.isVideoOrientationSupported {connection.videoOrientation = .portrait}
-            self.photos.capturePhoto(with:settings,delegate:self)
+        guard session.isRunning,let d=device,let connection=photos.connection(with:.video),connection.isActive else {
+            finish(error:CameraFailure.message("Камера ещё не готова к съёмке")); return
         }
-        if captureMode == .hdr,let d=device {
-            do {
-                try d.lockForConfiguration()
-                if d.isExposureModeSupported(.continuousAutoExposure) {d.exposureMode = .continuousAutoExposure}
-                let range:Float=[2,3,4].contains(hdrRange) ? hdrRange:(total==3 ? 2:total==5 ? 3:4)
-                // Reference exposure first, then alternating negative/positive EV.
-                let slot=index==0 ? 0:((index+1)/2)*(index%2==1 ? -1:1)
-                let ev=baseBias+Float(slot)*range/Float(total/2)
-                d.setExposureTargetBias(ev.clamped(to:d.minExposureTargetBias...d.maxExposureTargetBias)) {_ in
-                    self.worker.asyncAfter(deadline:.now()+0.15,execute:send)
-                }; d.unlockForConfiguration()
-            } catch {finish(error:error)}
-        } else {send()}
+        guard photos.availablePhotoCodecTypes.contains(.jpeg) else {
+            finish(error:CameraFailure.message("JPEG недоступен для этого объектива")); return
+        }
+        let settings:AVCapturePhotoSettings
+        batchCount=1
+        if captureMode == .noise || captureMode == .hdr {
+            // Submit a hardware bracket before encoding, disk I/O or Rust processing.
+            let limit=photos.maxBracketedCapturePhotoCount
+            guard limit>0 else {finish(error:CameraFailure.message("Объектив не поддерживает быструю серию")); return}
+            batchCount=min(remaining,limit)
+            var bracket:[AVCaptureBracketedStillImageSettings]=[]
+            let range:Float=[2,3,4].contains(hdrRange) ? hdrRange:(total==3 ? 2:total==5 ? 3:4)
+            for offset in 0..<batchCount {
+                if captureMode == .noise {
+                    bracket.append(AVCaptureManualExposureBracketedStillImageSettings.manualExposureSettings(
+                        exposureDuration:wasDuration,iso:wasISO))
+                } else {
+                    let frame=index+offset
+                    let slot=frame==0 ? 0:((frame+1)/2)*(frame%2==1 ? -1:1)
+                    let ev=(baseBias+Float(slot)*range/Float(total/2)).clamped(to:d.minExposureTargetBias...d.maxExposureTargetBias)
+                    bracket.append(AVCaptureAutoExposureBracketedStillImageSettings.autoExposureSettings(exposureTargetBias:ev))
+                }
+            }
+            let burst=AVCapturePhotoBracketSettings(rawPixelFormatType:0,
+                processedFormat:[AVVideoCodecKey:AVVideoCodecType.jpeg],bracketedSettings:bracket)
+            settings=burst
+        } else if captureMode == .raw {
+            guard let format=photos.availableRawPhotoPixelFormatTypes.first(where:{!AVCapturePhotoOutput.isAppleProRAWPixelFormat($0)}) else {
+                finish(error:CameraFailure.message("Bayer RAW недоступен для этого объектива")); return
+            }
+            settings=AVCapturePhotoSettings(rawPixelFormatType:format,processedFormat:[AVVideoCodecKey:AVVideoCodecType.jpeg])
+        } else {
+            settings=AVCapturePhotoSettings(format:[AVVideoCodecKey:AVVideoCodecType.jpeg])
+        }
+        if total==1,captureMode != .raw,photos.supportedFlashModes.contains(.on) {settings.flashMode=flash ? .on:.off}
+        // Bayer RAW rejects .quality (confirmed by device crash backtraces).
+        // Brackets and manual exposure must also avoid multi-frame ISP fusion.
+        let manual=device?.exposureMode == .custom || device?.exposureMode == .locked
+        settings.photoQualityPrioritization = (captureMode == .raw || total>1 || manual) ? .speed:.quality
+        if connection.isVideoOrientationSupported {connection.videoOrientation = .portrait}
+        activeCaptureID=settings.uniqueID
+        photos.capturePhoto(with:settings,delegate:self)
     }
     func photoOutput(_ output:AVCapturePhotoOutput,didFinishProcessingPhoto photo:AVCapturePhoto,error:Error?) {
         worker.async {
+            guard self.taking,photo.resolvedSettings.uniqueID==self.activeCaptureID else {return}
             if let error {self.finish(error:error); return}
-            guard self.taking,let data=photo.fileDataRepresentation() else {return}
-            if let folder=self.archive {
-                do {try data.write(to:folder.appendingPathComponent("frame-\(self.index)."+(photo.isRawPhoto ? "dng":"jpg")),options:.atomic)}
-                catch {self.finish(error:error); return}
+            guard let data=photo.fileDataRepresentation() else {
+                self.finish(error:CameraFailure.message("Камера не вернула данные снимка")); return
             }
             if photo.isRawPhoto {self.rawFiles.append(data)} else {self.sequence.append(data)}
         }
     }
     func photoOutput(_ output:AVCapturePhotoOutput,didFinishCaptureFor resolvedSettings:AVCaptureResolvedPhotoSettings,error:Error?) {
         worker.async {
-            guard self.taking else {return}
+            guard self.taking,resolvedSettings.uniqueID==self.activeCaptureID else {return}
             if let error {self.finish(error:error); return}
-            self.remaining-=1; self.index+=1
+            self.remaining-=self.batchCount; self.index+=self.batchCount
             self.publish{self.status="Кадр \(self.index)/\(self.total)"}
             if self.remaining>0 {self.nextPhoto(flash:false); return}
             do {
                 guard self.sequence.count==self.total else {throw CameraFailure.message("Получена неполная серия")}
+                let captureSeconds=Date().timeIntervalSince(self.captureStarted)
                 self.restore()
+                self.publish{self.status="Сохранение исходников"}
+                try self.archiveOriginals()
+                let started=Date()
                 let result:Data
                 if self.captureMode == .noise || self.captureMode == .hdr {
                     self.publish{self.status="Обработка Rust"}
                     result=try self.processor.run(self.sequence,mode:self.captureMode == .noise ? 1:2,options:self.captureOptions)
                 } else {result=self.sequence[0]}
+                let elapsed=Date().timeIntervalSince(started)
+                self.completionStatus=String(format:"Сохранено · съёмка %.1f с · обработка %.1f с",captureSeconds,elapsed)
+                self.publish{self.status=String(format:"Обработка: %.1f с · сохранение в Фото",elapsed)}
                 self.savePhoto(result,raw:self.rawFiles)
             } catch {self.finish(error:error)}
         }
+    }
+    private func archiveOriginals() throws {
+        guard let folder=archive else {return}
+        for (i,data) in sequence.enumerated() {try data.write(to:folder.appendingPathComponent("frame-\(i).jpg"),options:.atomic)}
+        for (i,data) in rawFiles.enumerated() {try data.write(to:folder.appendingPathComponent("frame-\(i).dng"),options:.atomic)}
     }
     private func restore() {
         guard let d=device,wasExposure != nil else {return}
@@ -248,14 +290,15 @@ final class CameraService: NSObject, ObservableObject, AVCapturePhotoCaptureDele
         }
     }
     private func finish(error:Error?) {
-        restore(); taking=false; sequence=[]; rawFiles=[]; archive=nil
-        publish {self.busy=false; self.status=error?.localizedDescription ?? "Сохранено в Фото"}
+        if error != nil {try? archiveOriginals()}
+        restore(); taking=false; activeCaptureID=nil; sequence=[]; rawFiles=[]; archive=nil
+        publish {self.busy=false; self.status=error?.localizedDescription ?? self.completionStatus}
     }
     func cancel() {processor.cancel(); worker.async {self.cancelled=true}}
     func edit(data:Data,options:ProcessingOptions) {
         worker.async {
             guard !self.taking,!self.movie.isRecording else {return}
-            self.taking=true; self.wasExposure=nil; self.wasFocus=nil; self.wasWB=nil
+            self.taking=true; self.completionStatus="Сохранено в Фото"; self.wasExposure=nil; self.wasFocus=nil; self.wasWB=nil
             self.publish{self.busy=true; self.status="Обработка Rust"}
             do {let result=try self.processor.run([data],mode:0,options:options); self.savePhoto(result,raw:[])} catch {self.finish(error:error)}
         }

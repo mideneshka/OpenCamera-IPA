@@ -4,3 +4,4 @@ build/
 *.xcworkspace/
 .DS_Store
 xcuserdata/
+work/

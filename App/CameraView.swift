@@ -6,6 +6,27 @@ import PhotosUI
 final class PreviewSurface:UIView {
     override class var layerClass:AnyClass {AVCaptureVideoPreviewLayer.self}
     var preview:AVCaptureVideoPreviewLayer {layer as! AVCaptureVideoPreviewLayer}
+    private let focusRing=CAShapeLayer()
+    private var focusGeneration=0
+    override init(frame:CGRect) {
+        super.init(frame:frame)
+        focusRing.strokeColor=UIColor.systemYellow.cgColor
+        focusRing.fillColor=UIColor.clear.cgColor
+        focusRing.lineWidth=2
+        focusRing.isHidden=true
+        layer.addSublayer(focusRing)
+    }
+    required init?(coder:NSCoder) {fatalError("init(coder:) has not been implemented")}
+    func showFocus(at point:CGPoint) {
+        focusGeneration+=1
+        let generation=focusGeneration
+        focusRing.path=UIBezierPath(rect:CGRect(x:point.x-32,y:point.y-32,width:64,height:64)).cgPath
+        focusRing.isHidden=false
+        DispatchQueue.main.asyncAfter(deadline:.now()+1.2) { [weak self] in
+            guard let self,self.focusGeneration==generation else {return}
+            self.focusRing.isHidden=true
+        }
+    }
 }
 struct CameraPreview:UIViewRepresentable {
     let camera:CameraService
@@ -23,7 +44,13 @@ struct CameraPreview:UIViewRepresentable {
         init(_ camera:CameraService) {self.camera=camera}
         @objc func tap(_ gesture:UITapGestureRecognizer) {
             guard let view=gesture.view as? PreviewSurface else {return}
-            camera.focus(view.preview.captureDevicePointConverted(fromLayerPoint:gesture.location(in:view)))
+            let location=gesture.location(in:view)
+            // Ignore letterboxing: focus only within the actual camera image.
+            let point=view.preview.captureDevicePointConverted(fromLayerPoint:location)
+            guard (0...1).contains(point.x),(0...1).contains(point.y),
+                  !camera.busy,!camera.recording else {return}
+            camera.focus(point)
+            view.showFocus(at:location)
         }
     }
 }

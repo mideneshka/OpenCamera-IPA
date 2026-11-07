@@ -67,16 +67,7 @@ final class RustProcessor {
                     return hc_add_rgba(handle,UInt32(w),UInt32(h),p.baseAddress,p.count)
                 }
                 try check(code)
-                if mode == 2 {
-                    guard let source=CGImageSourceCreateWithData(data as CFData,nil),
-                          let properties=CGImageSourceCopyPropertiesAtIndex(source,0,nil) as? [String:Any],
-                          let exif=properties[kCGImagePropertyExifDictionary as String] as? [String:Any],
-                          let time=exif[kCGImagePropertyExifExposureTime as String] as? NSNumber,
-                          let iso=(exif[kCGImagePropertyExifISOSpeedRatings as String] as? [NSNumber])?.first else {
-                        throw CameraFailure.message("ÕÂÚ ‰‡ÌÌ˚ı ˝ÍÒÔÓÁËˆËË: HDR ÓÚÏÂÌ∏Ì, ËÒıÓ‰ÌËÍË ÒÓı‡ÌÂÌ˚")
-                    }
-                    try check(hc_set_exposure(handle,time.floatValue*iso.floatValue))
-                }
+                if mode == 2 { try addExposure(data) }
             }
         }
         guard let (w,h)=dimensions else { throw CameraFailure.message("–ù–µ—Ç –∫–∞–¥—Ä–æ–≤") }
@@ -94,4 +85,17 @@ final class RustProcessor {
               let result=UIImage(cgImage:cg).pngData() else { throw CameraFailure.message("–ù–µ —É–¥–∞–ª–æ—Å—å –∑–∞–ø–∏—Å–∞—Ç—å PNG") }
         return result
     }
+    private func addExposure(_ data:Data) throws {
+        guard let source=CGImageSourceCreateWithData(data as CFData,nil) else { throw metadataError() }
+        guard let properties=CGImageSourceCopyPropertiesAtIndex(source,0,nil) as? [String:Any] else { throw metadataError() }
+        guard let exif=properties[kCGImagePropertyExifDictionary as String] as? [String:Any] else { throw metadataError() }
+        guard let time=exif[kCGImagePropertyExifExposureTime as String] as? NSNumber else { throw metadataError() }
+        guard let speeds=exif[kCGImagePropertyExifISOSpeedRatings as String] as? [NSNumber], let iso=speeds.first else { throw metadataError() }
+        let exposure:Float=time.floatValue * iso.floatValue
+        try check(hc_set_exposure(handle,exposure))
+    }
+    private func metadataError()->CameraFailure {
+        .message("–ù–µ—Ç –¥–∞–Ω–Ω—ã—Ö —ç–∫—Å–ø–æ–∑–∏—Ü–∏–∏: HDR –æ—Ç–º–µ–Ω—ë–Ω, –∏—Å—Ö–æ–¥–Ω–∏–∫–∏ —Å–æ—Ö—Ä–∞–Ω–µ–Ω—ã")
+    }
+
 }

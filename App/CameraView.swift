@@ -123,10 +123,15 @@ struct CameraView:View {
             Form {
                 Section("Съёмка") {
                     Picker("Кадров NR/HDR",selection:$frames){ForEach([3,5,7],id:\.self){Text("\($0)").tag($0)}}
+                    Picker("HDR: диапазон",selection:$hdrRange) {
+                        Text("Авто").tag(0)
+                        ForEach([2,3,4],id:\.self){Text("±\($0) EV").tag($0)}
+                    }
+                    Text("Выравнивание яркости HDR: 3/5/7 кадров. Держи телефон неподвижно до окончания серии.").font(.caption)
                     Picker("Таймер",selection:$timer){ForEach([0,3,5,10],id:\.self){Text("\($0) с").tag($0)}}
                     Toggle("Сетка",isOn:$grid)
                     Text(camera.rawSupported ? "RAW доступен для текущего объектива":"RAW не объявлен текущим объективом").font(.caption)
-                    Text("HDR здесь — объединение экспозиций JPEG. Это не Apple Smart HDR. Серия сохраняет исходный охват, без обрезки.").font(.caption)
+                    Text("HDR учитывает выдержку и ISO исходных JPEG и сжимает диапазон светов и теней. Диапазон EV ограничивается камерой. Охват сохраняется.").font(.caption)
                 }
                 Section("Экспозиция и фокус") {
                     Toggle("Ручные ISO и выдержка",isOn:$manual).onChange(of:manual){value in if value {applyExposure()} else {camera.autoExposure()}}
@@ -154,7 +159,7 @@ struct CameraView:View {
                     setting("Температура",value:$temperature,range:-1...1)
                     setting("Резкость",value:$sharpen,range:0...1)
                     Button("Нейтральная обработка") {denoise=0; dehaze=0; contrast=0; saturation=1; temperature=0; sharpen=0}
-                    Text("Обработка локальная. NLM пока работает на CPU и может быть медленным. RAW SR, RCAS и RealESRGAN ещё не подключены.").font(.caption)
+                    Text("Обработка локальная. NLM пока работает на CPU и может быть медленным. RAW SR и RealESRGAN отложены.").font(.caption)
                 }
             }.disabled(camera.busy || camera.recording)
             .navigationTitle("HyabridCam")

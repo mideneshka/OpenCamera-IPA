@@ -4,12 +4,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 [[ "$(uname -s)" == Darwin ]] || { echo 'macOS and Xcode required'; exit 1; }
 target=aarch64-apple-ios
+arch=arm64
 sdk=iphoneos
 destination='generic/platform=iOS'
 if [[ "${1:-device}" == simulator ]]; then
   sdk=iphonesimulator
   destination='generic/platform=iOS Simulator'
-  if [[ "$(uname -m)" == arm64 ]]; then target=aarch64-apple-ios-sim; else target=x86_64-apple-ios; fi
+  if [[ "$(uname -m)" == arm64 ]]; then target=aarch64-apple-ios-sim; else target=x86_64-apple-ios; arch=x86_64; fi
 fi
 rustup target add "$target"
 cargo test --manifest-path core/Cargo.toml --locked --offline
@@ -19,7 +20,7 @@ cp "core/target/$target/release/libhyabrid_core.a" "build/rust/$sdk/"
 xcodegen generate
 xcodebuild -project HyabridCam.xcodeproj -scheme HyabridCam -configuration Release \
   -sdk "$sdk" -destination "$destination" -derivedDataPath build/xcode \
-  build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=''
+  build ARCHS="$arch" ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=''
 if [[ "$sdk" == iphoneos ]]; then
   # Rebuild only our own staging folder, never a computed parent directory.
   rm -rf build/package

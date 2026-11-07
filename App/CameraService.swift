@@ -29,6 +29,7 @@ final class CameraService: NSObject, ObservableObject, AVCapturePhotoCaptureDele
     private var captureMode=CaptureMode.photo
     private var captureOptions=ProcessingOptions()
     private var baseBias:Float=0
+    private var hdrRange:Float=0
     private var wasFocus:AVCaptureDevice.FocusMode?
     private var wasWB:AVCaptureDevice.WhiteBalanceMode?
     private var wasExposure:AVCaptureDevice.ExposureMode?
@@ -142,12 +143,12 @@ final class CameraService: NSObject, ObservableObject, AVCapturePhotoCaptureDele
     private func control(_ action:@escaping (AVCaptureDevice)->Void) {
         worker.async {guard !self.taking,let d=self.device else {return}; do {try d.lockForConfiguration(); defer {d.unlockForConfiguration()}; action(d)} catch {self.fail(error)}}
     }
-    func capture(mode:CaptureMode,frames:Int,options:ProcessingOptions,flash:Bool) {
+    func capture(mode:CaptureMode,frames:Int,hdrRange:Float,options:ProcessingOptions,flash:Bool) {
         worker.async {
             guard self.configured,!self.taking,!self.movie.isRecording else {return}
             if mode == .video {self.beginVideo(); return}
             self.taking=true; self.cancelled=false; self.sequence=[]; self.rawFiles=[]
-            self.captureMode=mode; self.captureOptions=options
+            self.captureMode=mode; self.captureOptions=options; self.hdrRange=hdrRange
             self.total=(mode == .noise || mode == .hdr) ? ([3,5,7].contains(frames) ? frames:3) : 1
             self.remaining=self.total; self.index=0; self.baseBias=self.device?.exposureTargetBias ?? 0
             do {
@@ -184,7 +185,7 @@ final class CameraService: NSObject, ObservableObject, AVCapturePhotoCaptureDele
             do {
                 try d.lockForConfiguration()
                 if d.isExposureModeSupported(.continuousAutoExposure) {d.exposureMode = .continuousAutoExposure}
-                let range:Float=total==3 ? 2:total==5 ? 3:4
+                let range:Float=[2,3,4].contains(hdrRange) ? hdrRange:(total==3 ? 2:total==5 ? 3:4)
                 // Reference exposure first, then alternating negative/positive EV.
                 let slot=index==0 ? 0:((index+1)/2)*(index%2==1 ? -1:1)
                 let ev=baseBias+Float(slot)*range/Float(total/2)

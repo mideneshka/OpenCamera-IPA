@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import UIKit
 import CoreImage
+import ImageIO
 
 struct ProcessingOptions {
     var denoise: Float = 0
@@ -66,6 +67,16 @@ final class RustProcessor {
                     return hc_add_rgba(handle,UInt32(w),UInt32(h),p.baseAddress,p.count)
                 }
                 try check(code)
+                if mode == 2 {
+                    guard let source=CGImageSourceCreateWithData(data as CFData,nil),
+                          let properties=CGImageSourceCopyPropertiesAtIndex(source,0,nil) as? [String:Any],
+                          let exif=properties[kCGImagePropertyExifDictionary as String] as? [String:Any],
+                          let time=exif[kCGImagePropertyExifExposureTime as String] as? NSNumber,
+                          let iso=(exif[kCGImagePropertyExifISOSpeedRatings as String] as? [NSNumber])?.first else {
+                        throw CameraFailure.message("Нет данных экспозиции: HDR отменён, исходники сохранены")
+                    }
+                    try check(hc_set_exposure(handle,time.floatValue*iso.floatValue))
+                }
             }
         }
         guard let (w,h)=dimensions else { throw CameraFailure.message("РќРµС‚ РєР°РґСЂРѕРІ") }

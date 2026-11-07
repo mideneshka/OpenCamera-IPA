@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 pub struct Context {
     frames: Vec<Image>,
+    exposures: Vec<f32>,
     output: Option<Image>,
     report: Vec<Alignment>,
     cancel: Arc<AtomicBool>,
@@ -29,6 +30,7 @@ fn guard(f: impl FnOnce() -> Result<()>) -> i32 {
 pub extern "C" fn hc_create() -> *mut Context {
     Box::into_raw(Box::new(Context {
         frames: Vec::new(),
+        exposures: Vec::new(),
         output: None,
         report: Vec::new(),
         cancel: Arc::new(AtomicBool::new(false)),
@@ -49,6 +51,7 @@ pub unsafe extern "C" fn hc_reset(ctx: *mut Context) -> i32 {
     guard(|| {
         let c = ctx.as_mut().ok_or(Error::Parameters)?;
         c.frames.clear();
+        c.exposures.clear();
         c.output = None;
         c.report.clear();
         c.cancel.store(false, Ordering::Relaxed);
@@ -100,8 +103,21 @@ pub unsafe extern "C" fn hc_add_rgba(
     })
 }
 /// # Safety
+/// Serial live handle. Set the effective exposure of the most recently added frame.
+#[no_mangle]
+pub unsafe extern "C" fn hc_set_exposure(ctx: *mut Context, exposure: f32) -> i32 {
+    guard(|| {
+        let c = ctx.as_mut().ok_or(Error::Parameters)?;
+        if !exposure.is_finite() || exposure <= 0.0 || c.frames.len() != c.exposures.len() + 1 {
+            return Err(Error::Parameters);
+        }
+        c.exposures.push(exposure);
+        Ok(())
+    })
+}
+/// # Safety
 /// Valid handle and readable settings; no concurrent calls except hc_cancel.
-/// mode: 0 single/editor, 1 NR, 2 exposure fusion (not linear-radiance HDR).
+/// mode: 0 single/editor, 1 NR, 2 exposure-aware JPEG HDR.
 #[no_mangle]
 pub unsafe extern "C" fn hc_run(
     ctx: *mut Context,
@@ -119,16 +135,20 @@ pub unsafe extern "C" fn hc_run(
         let result = match mode {
             0 => process(c.frames.first().ok_or(Error::NoFrames)?, settings, &stop)?,
             1 | 2 => {
-                let fused = fuse(
-                    &c.frames,
-                    if mode == 1 {
-                        FusionMode::NoiseReduction
-                    } else {
-                        FusionMode::ExposureFusion
-                    },
-                    radius,
-                    &stop,
-                )?;
+                let fused = if mode == 2 {
+                    fuse_exposed(&c.frames, &c.exposures, radius, &stop)?
+                } else {
+                    fuse(
+                        &c.frames,
+                        if mode == 1 {
+                            FusionMode::NoiseReduction
+                        } else {
+                            FusionMode::ExposureFusion
+                        },
+                        radius,
+                        &stop,
+                    )?
+                };
                 c.report = fused.alignments;
                 process(&fused.image, settings, &stop)?
             }

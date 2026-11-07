@@ -32,6 +32,7 @@ struct CameraView:View {
     @Environment(\.scenePhase) private var phase
     @AppStorage("capture.mode") private var modeName=CaptureMode.photo.rawValue
     @AppStorage("capture.frames") private var frames=3
+    @AppStorage("capture.hdrRange") private var hdrRange=0
     @AppStorage("capture.timer") private var timer=0
     @AppStorage("capture.grid") private var grid=true
     @AppStorage("post.denoise") private var denoise=0.0
@@ -114,7 +115,7 @@ struct CameraView:View {
             }
             countdown=0
             guard !Task.isCancelled else {return}
-            camera.capture(mode:selectedMode,frames:selectedFrames,options:selectedOptions,flash:selectedFlash)
+            camera.capture(mode:selectedMode,frames:selectedFrames,hdrRange:Float(hdrRange),options:selectedOptions,flash:selectedFlash)
         }
     }
     private var settings:some View {

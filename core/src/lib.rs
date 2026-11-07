@@ -171,6 +171,34 @@ pub fn fuse(
     radius: i32,
     stop: &impl Fn() -> bool,
 ) -> Result<FusionResult> {
+    fuse_impl(frames, mode, radius, None, stop)
+}
+/// Relative shutter*time ISO from capture metadata, referenced to the first frame.
+/// JPEG response is approximated by sRGB; this is not a calibrated RAW HDR pipeline.
+pub fn fuse_exposed(
+    frames: &[Image],
+    exposures: &[f32],
+    radius: i32,
+    stop: &impl Fn() -> bool,
+) -> Result<FusionResult> {
+    if exposures.len() != frames.len() || exposures.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+        return Err(Error::Parameters);
+    }
+    fuse_impl(
+        frames,
+        FusionMode::ExposureFusion,
+        radius,
+        Some(exposures),
+        stop,
+    )
+}
+fn fuse_impl(
+    frames: &[Image],
+    mode: FusionMode,
+    radius: i32,
+    exposures: Option<&[f32]>,
+    stop: &impl Fn() -> bool,
+) -> Result<FusionResult> {
     let base = frames.first().ok_or(Error::NoFrames)?;
     if frames.len() > 7 {
         return Err(Error::Parameters);
@@ -207,18 +235,41 @@ pub fn fuse(
                 if mode == FusionMode::NoiseReduction && i > 0 && (value - reference).abs() > 0.10 {
                     continue;
                 }
-                let weight = if mode == FusionMode::ExposureFusion {
+                // Ignore sensor-floor and clipped samples when an exposure model is available.
+                let weight = if exposures.is_some() {
+                    let peak = frame.pixels[q..q + 3].iter().copied().max().unwrap() as f32 / 255.0;
+                    if value < 0.015 || peak > 0.98 {
+                        continue;
+                    }
+                    (value.min(1.0 - peak)).max(0.001)
+                } else if mode == FusionMode::ExposureFusion {
                     (-((value - 0.5) / 0.24).powi(2)).exp().max(0.001)
                 } else {
                     1.0
                 };
                 for (c, channel) in rgb.iter_mut().enumerate() {
-                    *channel += linear(frame.pixels[q + c] as f32 / 255.0) * weight;
+                    let scale = exposures.map(|e| e[0] / e[i]).unwrap_or(1.0);
+                    *channel += linear(frame.pixels[q + c] as f32 / 255.0) * weight * scale;
                 }
                 total += weight;
             }
+            if total == 0.0 {
+                out[p..p + 4].copy_from_slice(&base.pixels[p..p + 4]);
+                continue;
+            }
+            for v in &mut rgb {
+                *v /= total;
+            }
+            if exposures.is_some() {
+                // One shared monotonic tone curve preserves colour ratios and highlight order.
+                let peak = rgb.iter().copied().fold(0.0, f32::max);
+                let gain = 1.0 / (0.35 + peak);
+                for v in &mut rgb {
+                    *v *= gain;
+                }
+            }
             for c in 0..3 {
-                out[p + c] = byte(srgb(rgb[c] / total));
+                out[p + c] = byte(srgb(rgb[c]));
             }
             out[p + 3] = base.pixels[p + 3];
         }
@@ -528,5 +579,62 @@ mod tests {
             fuse(&[a, b], FusionMode::NoiseReduction, 1, &|| false),
             Err(Error::Dimensions)
         ));
+    }
+}
+
+#[cfg(test)]
+mod hdr_tests {
+    use super::*;
+    #[test]
+    fn hdr_recovers_shadow_and_clipped_highlight_order() {
+        for count in [3, 5, 7] {
+            let ev_range = if count == 3 {
+                2.0
+            } else if count == 5 {
+                3.0
+            } else {
+                4.0
+            };
+            let mut exposures = vec![1.0];
+            for i in 1..count {
+                let slot = ((i + 1) / 2) as f32 * if i % 2 == 1 { -1.0 } else { 1.0 };
+                exposures.push(2.0f32.powf(slot * ev_range / (count / 2) as f32));
+            }
+            let frames: Vec<Image> = exposures
+                .iter()
+                .map(|e| {
+                    let mut pixels = vec![255; 128 * 64 * 4];
+                    for y in 0..64 {
+                        for x in 0..128 {
+                            let scene = [0.004, 0.02, 1.3, 2.4][x / 32];
+                            let v = byte(srgb(scene * e));
+                            let p = (y * 128 + x) * 4;
+                            pixels[p..p + 3].fill(v);
+                        }
+                    }
+                    Image::new(128, 64, pixels).unwrap()
+                })
+                .collect();
+            let result = fuse_exposed(&frames, &exposures, 0, &|| false).unwrap();
+            let v: Vec<u8> = (0..4)
+                .map(|i| result.image.pixels[(32 * 128 + i * 32 + 16) * 4])
+                .collect();
+            assert!(v[1] > v[0] + 2, "shadow count={count}: {v:?}");
+            assert!(
+                v[3] > v[2] + 2 && v[3] < 255,
+                "highlight count={count}: {v:?}"
+            );
+            assert_eq!(result.image.width, 128);
+        }
+    }
+    #[test]
+    fn hdr_requires_valid_exposure_metadata() {
+        let im = Image::new(8, 8, vec![128; 256]).unwrap();
+        for exposures in [vec![], vec![0.0], vec![f32::NAN], vec![-1.0]] {
+            assert!(matches!(
+                fuse_exposed(std::slice::from_ref(&im), &exposures, 0, &|| false),
+                Err(Error::Parameters)
+            ));
+        }
     }
 }

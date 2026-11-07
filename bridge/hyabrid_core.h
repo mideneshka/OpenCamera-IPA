@@ -13,6 +13,7 @@ typedef struct hc_cancel_flag hc_cancel_flag;
 const hc_cancel_flag *hc_cancel_token(const hc_context *ctx);
 void hc_cancel(const hc_cancel_flag *token);
 int32_t hc_add_rgba(hc_context *ctx,uint32_t width,uint32_t height,const uint8_t *data,size_t len);
+int32_t hc_set_exposure(hc_context *ctx,float exposure);
 int32_t hc_run(hc_context *ctx,uint32_t mode,int32_t radius,const hc_adjustments *settings);
 int32_t hc_copy_output(const hc_context *ctx,uint8_t *out,size_t capacity);
 int32_t hc_copy_report(const hc_context *ctx,hc_alignment *out,size_t capacity);
